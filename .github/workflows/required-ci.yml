@@ -1,0 +1,86 @@
+name: Eupry Required CI
+
+# This caller is intentionally separate from deployment workflows.
+# Profile: bootstrap-only
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: CI / Bootstrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate repository basics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          if [[ -f package.json ]]; then node -e 'JSON.parse(require("fs").readFileSync("package.json", "utf8"))'; fi
+          if [[ -f composer.json ]]; then php -r '$d=json_decode(file_get_contents("composer.json"), true); if (!is_array($d)) exit(1);'; fi
+          if [[ -f Cargo.toml ]]; then test -s Cargo.toml; fi
+          if [[ -f pyproject.toml ]]; then python3 -m py_compile $(find . -maxdepth 3 -name "*.py" -not -path "*/.git/*"); fi
+
+  required:
+    name: CI / Required
+    needs: bootstrap
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+      REQUIRED_CHECKS: |
+        CI / Bootstrap
+    steps:
+      - name: Wait for required checks
+        shell: bash
+        run: |
+          if [[ "${{ needs.bootstrap.result }}" != "success" ]]; then
+            echo "Bootstrap validation failed." >&2
+            exit 1
+          fi
+          mapfile -t required < <(printf '%s\n' "$REQUIRED_CHECKS" | sed '/^[[:space:]]*$/d')
+          deadline=$((SECONDS + 3600))
+          while (( SECONDS < deadline )); do
+            checks="$(gh api "/repos/$REPOSITORY/commits/$SHA/check-runs?per_page=100" --jq '.check_runs')"
+            statuses="$(gh api "/repos/$REPOSITORY/commits/$SHA/status" --jq '.statuses')"
+            pending=0
+            failed=0
+            for prefix in "${required[@]}"; do
+              prefix="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$prefix")"
+              matches="$(jq --arg prefix "$prefix" '[.[] | select(.name | startswith($prefix))]' <<<"$checks")"
+              if [[ "$(jq 'length' <<<"$matches")" == 0 ]]; then
+                status_matches="$(jq --arg prefix "$prefix" '[.[] | select(.context | startswith($prefix))]' <<<"$statuses")"
+                if [[ "$(jq 'length' <<<"$status_matches")" == 0 ]]; then
+                  echo "Waiting for check prefix: $prefix"
+                  pending=1
+                elif jq -e 'any(.[]; .state == "failure" || .state == "error")' <<<"$status_matches" >/dev/null; then
+                  echo "Required status failed: $prefix" >&2
+                  failed=1
+                elif ! jq -e 'all(.[]; .state == "success")' <<<"$status_matches" >/dev/null; then
+                  pending=1
+                fi
+              elif jq -e 'any(.[]; .conclusion == "failure" || .conclusion == "cancelled" || .conclusion == "timed_out" || .conclusion == "action_required")' <<<"$matches" >/dev/null; then
+                echo "Required check failed: $prefix" >&2
+                failed=1
+              elif ! jq -e 'all(.[]; .status == "completed" and .conclusion == "success")' <<<"$matches" >/dev/null; then
+                echo "Waiting for check completion: $prefix"
+                pending=1
+              fi
+            done
+            (( failed )) && exit 1
+            (( ! pending )) && { echo 'All required checks passed.'; exit 0; }
+            sleep 20
+          done
+          echo 'Timed out waiting for required checks.' >&2
+          exit 1
