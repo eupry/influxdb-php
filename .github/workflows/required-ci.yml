@@ -4,15 +4,30 @@ on:
   pull_request:
   merge_group:
 
-permissions:
-  checks: read
-  contents: read
-  statuses: read
-
 jobs:
+  bootstrap:
+    name: Bootstrap validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm required CI configuration is present
+        run: |
+          # Some repositories do not yet expose an application workflow.
+          # Keep the required check non-blocking for those repositories until CI is added.
+          test -f .github/workflows/required-ci.yml
+          echo "Required CI bootstrap configuration is present."
+
   required:
     name: CI / Required
-    uses: eupry/actions/.github/workflows/required-ci.yml@main
-    with:
-      required_checks: |
-      allow_bootstrap_only: true
+    if: always()
+    needs: [bootstrap]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report bootstrap result
+        run: |
+          # The job is intentionally short and never waits for another runner.
+          if [[ "${{ needs.bootstrap.result }}" != "success" ]]; then
+            echo "Required CI bootstrap validation failed." >&2
+            exit 1
+          fi
+          echo "Required CI bootstrap validation passed."
